@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -21,6 +22,7 @@ import (
 func main() {
 	var notification bool
 	var server string
+	var verbose bool
 	appname := os.Args[0]
 	cmd := cobra.Command{
 		Short: "Send a MsgPack RPC REQUEST or NOTIFICATION.",
@@ -37,7 +39,11 @@ func main() {
 			"      - Use '{' and '}' to start and end a map.\n" +
 			"        Keys and values should be listed in order { KEY1 VAL1 KEY2 VAL2 }.\n" +
 			"      - Any other value is treated as a string, or you may use the 'str:' prefix\n" +
-			"        explicitly in case of ambiguity (e.g. str:42)",
+			"        explicitly in case of ambiguity (e.g. str:42)\n" +
+			"\n" +
+			"  The call response is printed in JSON (unless verbose flag is set, in such case other\n" +
+			"  details are printed in plain text) with a return code 0.\n" +
+			"  If the call returns an error, it is printed in JSON with a return code 1.",
 		Run: func(cmd *cobra.Command, cliArgs []string) {
 			// Compose method and arguments
 			args, rest, err := composeArgs(append(append([]string{"["}, cliArgs[1:]...), "]"))
@@ -63,20 +69,28 @@ func main() {
 				os.Exit(1)
 			}
 
-			if notification {
-				fmt.Printf("Sending notification for method '%s', with parameters: ", method)
-			} else {
-				fmt.Printf("Sending request for method '%s', with parameters: ", method)
+			if verbose {
+				if notification {
+					fmt.Printf("Sending notification for method '%s', with parameters: ", method)
+				} else {
+					fmt.Printf("Sending request for method '%s', with parameters: ", method)
+				}
+				print(args)
 			}
-			print(args)
 			if !notification {
 				if rpcErr != nil {
-					fmt.Print("Got RPC error: ")
+					if verbose {
+						fmt.Print("Got RPC error: ")
+					}
 					print(rpcErr)
+					os.Exit(1)
 				}
 				if rpcResp != nil {
-					fmt.Print("Got RPC response: ")
+					if verbose {
+						fmt.Print("Got RPC response: ")
+					}
 					print(rpcResp)
+					os.Exit(0)
 				}
 			}
 		},
@@ -89,9 +103,12 @@ func main() {
 	cmd.Flags().StringVarP(
 		&server, "server", "s", "/var/run/arduino-router.sock",
 		"Server address (file path for unix socket or host:port for TCP socket)")
+	cmd.Flags().BoolVarP(
+		&verbose, "verbose", "v", false,
+		"Increase verbosity of the output")
 	if err := cmd.Execute(); err != nil {
 		fmt.Printf("Use: %s -h for help.\n", appname)
-		os.Exit(1)
+		os.Exit(200)
 	}
 }
 
@@ -209,57 +226,6 @@ func send(ctx context.Context, server string, method string, args []any, notific
 }
 
 func print(v any) {
-	for _, l := range encode(v) {
-		fmt.Println(l)
-	}
-}
-
-func encode(v any) []string {
-	indent := func(in []string) []string {
-		for i := range in {
-			in[i] = "  " + in[i]
-		}
-		return in
-	}
-	switch val := v.(type) {
-	case nil:
-		return []string{"nil"}
-	case bool:
-		return []string{fmt.Sprint(val)}
-	case int:
-		return []string{fmt.Sprint(val)}
-	case float32:
-		return []string{fmt.Sprintf("f32:%v", val)}
-	case float64:
-		return []string{fmt.Sprintf("f64:%v", val)}
-	case string:
-		return []string{fmt.Sprintf("%q", val)}
-	case []any:
-		if len(val) == 0 {
-			return []string{"[ ]"}
-		}
-		result := []string{"["}
-		for _, elem := range val {
-			result = append(result, indent(encode(elem))...)
-		}
-		result = append(result, "]")
-		return result
-	case map[any]any:
-		if len(val) == 0 {
-			return []string{"{ }"}
-		}
-		result := []string{"{"}
-		for k, v := range val {
-			key := indent(encode(k))
-			value := encode(v)
-			i := len(key) - 1
-			key[i] = key[i] + ": " + value[0]
-			result = append(result, key...)
-			result = append(result, indent(value[1:])...)
-		}
-		result = append(result, "}")
-		return result
-	default:
-		panic(fmt.Sprintf("unsupported type: %T", v))
-	}
+	b, _ := json.MarshalIndent(v, "", "  ")
+	fmt.Println(string(b))
 }
