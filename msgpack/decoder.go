@@ -14,6 +14,27 @@ import (
 	"math"
 )
 
+// MaxNestingDepth is the maximum number of nested arrays and maps accepted
+// by the decoding functions. It bounds the recursion depth of the decoder,
+// so a malicious input can't trigger a stack overflow.
+const MaxNestingDepth = 64
+
+// ErrMaxNestingDepthExceeded is returned when the decoded value has more than
+// MaxNestingDepth nested arrays or maps.
+var ErrMaxNestingDepthExceeded = errors.New("msgpack: max nesting depth exceeded")
+
+// maxPreallocatedElements is the maximum number of array elements that are
+// preallocated based on the length declared in the array header. Bigger
+// arrays are grown as the elements are actually read, so a malicious header
+// can't trigger a huge allocation.
+const maxPreallocatedElements = 1024
+
+// maxPreallocatedBytes is the maximum number of bytes that are preallocated
+// based on the length declared in a string, binary or extension header.
+// Bigger payloads are grown as the data is actually read, so a malicious
+// header can't trigger a huge allocation.
+const maxPreallocatedBytes = 64 * 1024
+
 // signExtend interprets the lowest n bits of v as a two's complement signed
 // integer of n bits, and returns it as an int64.
 func signExtend(v uint64, n uint) int64 {
@@ -22,12 +43,17 @@ func signExtend(v uint64, n uint) int64 {
 }
 
 // Decode reads a single, complete MessagePack value from in and returns it as
-// a [Value].
+// a [Value]. Arrays and maps are decoded recursively, up to [MaxNestingDepth]
+// levels.
 //
 // Decode reads exactly the bytes that make up the value, so it can be called
 // repeatedly to read a stream of consecutive values. If in is already at its
 // end, Decode returns [io.EOF]; read errors are returned as they are.
 func Decode(in io.Reader) (Value, error) {
+	return decode(in, 0)
+}
+
+func decode(in io.Reader, depth int) (Value, error) {
 	read8 := func() (uint64, error) {
 		var buf [1]byte
 		if _, err := io.ReadFull(in, buf[:]); err != nil {
@@ -57,29 +83,51 @@ func Decode(in io.Reader) (Value, error) {
 		return binary.BigEndian.Uint64(buf[:]), nil
 	}
 	readN := func(n uint64) ([]byte, error) {
-		buf := make([]byte, n)
-		if _, err := io.ReadFull(in, buf); err != nil {
+		if n <= maxPreallocatedBytes {
+			buf := make([]byte, n)
+			if _, err := io.ReadFull(in, buf); err != nil {
+				return nil, err
+			}
+			return buf, nil
+		}
+		if n > math.MaxInt64 {
+			// Not reachable: MessagePack lengths are at most 32 bits.
+			return nil, errors.New("msgpack: length too large")
+		}
+		// Do not trust the declared length: grow the buffer as data arrives.
+		var buf bytes.Buffer
+		if _, err := io.CopyN(&buf, in, int64(n)); err != nil {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
 			return nil, err
 		}
-		return buf, nil
+		return buf.Bytes(), nil
 	}
 	readArray := func(l uint64) (Array, error) {
-		a := make(Array, l)
-		for i := range l {
-			if v, err := Decode(in); err != nil {
+		if depth >= MaxNestingDepth {
+			return nil, ErrMaxNestingDepthExceeded
+		}
+		// Do not trust the declared length: grow the array as elements are read.
+		a := make(Array, 0, min(l, maxPreallocatedElements))
+		for range l {
+			if v, err := decode(in, depth+1); err != nil {
 				return nil, err
 			} else {
-				a[i] = v
+				a = append(a, v)
 			}
 		}
 		return a, nil
 	}
 	readMap := func(l uint64) (Map, error) {
+		if depth >= MaxNestingDepth {
+			return Map{}, ErrMaxNestingDepthExceeded
+		}
 		m := NewMap()
 		for range l {
-			if k, err := Decode(in); err != nil {
+			if k, err := decode(in, depth+1); err != nil {
 				return Map{}, err
-			} else if v, err := Decode(in); err != nil {
+			} else if v, err := decode(in, depth+1); err != nil {
 				return Map{}, err
 			} else {
 				m.Set(k, v)
@@ -587,10 +635,10 @@ func DecodeSingle(in io.Reader) (readBytes []byte, kind ValueKind, elementsFollo
 // DecodeRaw reads a single, complete MessagePack value from in and returns
 // its encoding as a [RawMessage], without building the corresponding [Value].
 // The structure is validated only as far as needed to find the end of the
-// value.
+// value; nesting is limited to [MaxNestingDepth] levels.
 func DecodeRaw(in io.Reader) (RawMessage, error) {
 	rawBuff := bytes.NewBuffer(nil)
-	err := decodeInto(in, rawBuff)
+	err := decodeInto(in, rawBuff, 0)
 	if err != nil {
 		return RawMessage{}, err
 	}
@@ -598,13 +646,14 @@ func DecodeRaw(in io.Reader) (RawMessage, error) {
 }
 
 // Skip reads and discards a single, complete MessagePack value from in,
-// including all the elements of arrays and maps.
-// It uses a small, fixed amount of memory regardless of the size of the value.
+// including all the elements of arrays and maps. Nesting is limited to
+// [MaxNestingDepth] levels. It uses a small, fixed amount of memory regardless
+// of the size of the value.
 func Skip(in io.Reader) error {
-	return decodeInto(in, io.Discard)
+	return decodeInto(in, io.Discard, 0)
 }
 
-func decodeInto(in io.Reader, out io.Writer) error {
+func decodeInto(in io.Reader, out io.Writer, depth int) error {
 	read8 := func() (uint64, error) {
 		var buf [1]byte
 		if _, err := io.ReadFull(in, buf[:]); err != nil {
@@ -642,8 +691,11 @@ func decodeInto(in io.Reader, out io.Writer) error {
 		return nil
 	}
 	skip := func(n uint64) error {
+		if depth >= MaxNestingDepth {
+			return ErrMaxNestingDepthExceeded
+		}
 		for range n {
-			if err := decodeInto(in, out); err != nil {
+			if err := decodeInto(in, out, depth+1); err != nil {
 				return err
 			}
 		}

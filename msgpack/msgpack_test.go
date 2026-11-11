@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1933,6 +1934,147 @@ func TestToString(t *testing.T) {
 	require.False(t, ok)
 }
 
+// allocatedBytes returns the number of bytes allocated on the heap while running f.
+func allocatedBytes(f func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+func TestDecodeLyingHeadersDoNotPreallocate(t *testing.T) {
+	// Each header declares the maximum possible length, but no payload follows.
+	headers := map[string][]byte{
+		"Array32": {0xdd, 0xff, 0xff, 0xff, 0xff, 0x01},
+		"Map32":   {0xdf, 0xff, 0xff, 0xff, 0xff, 0x01, 0x01},
+		"Str32":   {0xdb, 0xff, 0xff, 0xff, 0xff, 'a'},
+		"Bin32":   {0xc6, 0xff, 0xff, 0xff, 0xff, 0x01},
+		"Ext32":   {0xc9, 0xff, 0xff, 0xff, 0xff, 0x01, 0x01},
+		"Array16": {0xdc, 0xff, 0xff, 0x01},
+		"Str16":   {0xda, 0xff, 0xff, 'a'},
+		"Nested":  {0x91, 0xdd, 0xff, 0xff, 0xff, 0xff, 0x91, 0xdb, 0xff, 0xff, 0xff, 0xff},
+	}
+	for name, in := range headers {
+		t.Run(name, func(t *testing.T) {
+			var err error
+			allocated := allocatedBytes(func() {
+				_, err = msgpack.Decode(bytes.NewBuffer(in))
+			})
+			require.Error(t, err)
+			require.Less(t, allocated, uint64(1024*1024))
+
+			allocated = allocatedBytes(func() {
+				_, err = msgpack.Unmarshal(bytes.NewBuffer(in))
+			})
+			require.Error(t, err)
+			require.Less(t, allocated, uint64(1024*1024))
+
+			allocated = allocatedBytes(func() {
+				_, err = msgpack.DecodeRaw(bytes.NewBuffer(in))
+			})
+			require.Error(t, err)
+			require.Less(t, allocated, uint64(1024*1024))
+
+			allocated = allocatedBytes(func() {
+				err = msgpack.Skip(bytes.NewBuffer(in))
+			})
+			require.Error(t, err)
+			require.Less(t, allocated, uint64(1024*1024))
+		})
+	}
+}
+
+func TestDecodeLargeValues(t *testing.T) {
+	// Values bigger than the preallocation limits must still be decoded correctly.
+	data := bytes.Repeat([]byte{0x01, 0x02, 0x03}, 100_000)
+
+	t.Run("String", func(t *testing.T) {
+		in, err := msgpack.Marshal(string(data))
+		require.NoError(t, err)
+		v, err := msgpack.Decode(bytes.NewBuffer(in))
+		require.NoError(t, err)
+		require.Equal(t, msgpack.NewString(string(data)), v)
+
+		_, err = msgpack.Decode(bytes.NewBuffer(in[:len(in)-1]))
+		require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	})
+
+	t.Run("Binary", func(t *testing.T) {
+		in, err := msgpack.Marshal(data)
+		require.NoError(t, err)
+		v, err := msgpack.Decode(bytes.NewBuffer(in))
+		require.NoError(t, err)
+		require.Equal(t, msgpack.NewBinary(data), v)
+
+		_, err = msgpack.Decode(bytes.NewBuffer(in[:len(in)-1]))
+		require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	})
+
+	t.Run("Extension", func(t *testing.T) {
+		in := append([]byte{0xc9, 0x00, 0x04, 0x93, 0xe0, 0x07}, data...) // ext32, 300000 bytes, type 7
+		v, err := msgpack.Decode(bytes.NewBuffer(in))
+		require.NoError(t, err)
+		require.Equal(t, msgpack.Extension{Type: 7, Data: data}, v)
+	})
+
+	t.Run("Array", func(t *testing.T) {
+		arr := make([]any, 5000)
+		expected := make(msgpack.Array, 5000)
+		for i := range arr {
+			arr[i] = i
+			expected[i] = msgpack.NewInteger(i)
+		}
+		in, err := msgpack.Marshal(arr)
+		require.NoError(t, err)
+		v, err := msgpack.Decode(bytes.NewBuffer(in))
+		require.NoError(t, err)
+		require.Equal(t, expected, v)
+	})
+}
+
+func TestDecodeMaxNestingDepth(t *testing.T) {
+	// nested builds `depth` nested containers around a nil value.
+	nested := func(depth int, container []byte) []byte {
+		in := bytes.Repeat(container, depth)
+		return append(in, 0xc0)
+	}
+	decoders := map[string]func(io.Reader) error{
+		"Decode":    func(r io.Reader) error { _, err := msgpack.Decode(r); return err },
+		"Unmarshal": func(r io.Reader) error { _, err := msgpack.Unmarshal(r); return err },
+		"DecodeRaw": func(r io.Reader) error { _, err := msgpack.DecodeRaw(r); return err },
+		"Skip":      msgpack.Skip,
+	}
+	containers := map[string][]byte{
+		"Array":    {0x91},       // [ ... ]
+		"MapValue": {0x81, 0xc0}, // { nil: ... }
+		"MapKey":   {0x81},       // { ...: nil } (the nil values are appended below)
+	}
+	for decName, decode := range decoders {
+		for contName, container := range containers {
+			t.Run(decName+"/"+contName, func(t *testing.T) {
+				build := func(depth int) []byte {
+					in := nested(depth, container)
+					if contName == "MapKey" {
+						in = append(in, bytes.Repeat([]byte{0xc0}, depth)...)
+					}
+					return in
+				}
+				require.NoError(t, decode(bytes.NewBuffer(build(msgpack.MaxNestingDepth))))
+				err := decode(bytes.NewBuffer(build(msgpack.MaxNestingDepth + 1)))
+				require.ErrorIs(t, err, msgpack.ErrMaxNestingDepthExceeded)
+			})
+		}
+
+		t.Run(decName+"/VeryDeep", func(t *testing.T) {
+			// Would overflow the stack without a depth limit
+			err := decode(bytes.NewBuffer(bytes.Repeat([]byte{0x91}, 10_000_000)))
+			require.ErrorIs(t, err, msgpack.ErrMaxNestingDepthExceeded)
+		})
+	}
+}
+
 func TestDecodeNestedMapKeys(t *testing.T) {
 	// Maps used as keys of maps: hashing them must not take exponential time
 	depth := 64
@@ -1951,5 +2093,34 @@ func TestDecodeNestedMapKeys(t *testing.T) {
 		require.NoError(t, err)
 	case <-time.After(5 * time.Second):
 		require.FailNow(t, "decoding nested map keys took too long")
+	}
+}
+
+func TestDecodeHugeLengthHeaders(t *testing.T) {
+	// Lengths above math.MaxInt32 must not overflow into negative values
+	// on 32-bit platforms: every decoder must fail with a read error instead
+	// of panicking or reporting success.
+	for _, data := range [][]byte{
+		{0xc6, 0xff, 0xff, 0xff, 0xff},       // bin 32
+		{0xc9, 0xff, 0xff, 0xff, 0xff, 0x01}, // ext 32
+		{0xdb, 0x80, 0x00, 0x00, 0x00},       // str 32
+		{0xdd, 0xff, 0xff, 0xff, 0xff},       // array 32
+		{0xdf, 0x80, 0x00, 0x00, 0x00},       // map 32
+	} {
+		_, err := msgpack.Decode(bytes.NewReader(data))
+		require.Error(t, err, "Decode % x", data)
+		err = msgpack.Skip(bytes.NewReader(data))
+		require.Error(t, err, "Skip % x", data)
+		_, err = msgpack.DecodeRaw(bytes.NewReader(data))
+		require.Error(t, err, "DecodeRaw % x", data)
+	}
+
+	_, kind, n, _, err := msgpack.DecodeSingle(bytes.NewReader([]byte{0xc9, 0xff, 0xff, 0xff, 0xff}))
+	if math.MaxUint > math.MaxUint32 {
+		require.NoError(t, err)
+		require.Equal(t, msgpack.ValueKindExtension, kind)
+		require.Equal(t, uint64(math.MaxUint32)+1, uint64(n))
+	} else {
+		require.Error(t, err)
 	}
 }
