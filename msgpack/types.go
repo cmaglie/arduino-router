@@ -334,6 +334,7 @@ type mapHashableKey any
 type Map struct {
 	v map[mapHashableKey]Value
 	k []Value
+	h []mapHashableKey // h[i] is the hash of k[i], cached to avoid recomputing it
 }
 
 // NewMap creates a new empty Map.
@@ -355,7 +356,7 @@ func (m Map) String() string {
 		if i > 0 {
 			s.WriteString(",")
 		}
-		v, _ := m.Get(k)
+		v := m.v[m.h[i]]
 		s.WriteString(k.String())
 		s.WriteString(":")
 		s.WriteString(v.String())
@@ -382,18 +383,29 @@ func (m *Map) Set(key Value, value Value) {
 	keyHash := key.hash()
 	if _, exists := m.v[keyHash]; exists {
 		// If the key already exists, we move the key to the end of the slice to maintain the insertion order.
-		m.k = slices.DeleteFunc(m.k, func(k Value) bool { return k.hash() == keyHash })
+		m.deleteKey(keyHash)
 	}
 	m.k = append(m.k, key)
-	m.v[key.hash()] = value
+	m.h = append(m.h, keyHash)
+	m.v[keyHash] = value
 }
 
 // Delete removes key and its associated value from the map. It does nothing
 // if the key is not present.
 func (m *Map) Delete(key Value) {
 	keyHash := key.hash()
-	delete(m.v, keyHash)
-	m.k = slices.DeleteFunc(m.k, func(k Value) bool { return k.hash() == keyHash })
+	if _, exists := m.v[keyHash]; exists {
+		delete(m.v, keyHash)
+		m.deleteKey(keyHash)
+	}
+}
+
+// deleteKey removes the key with the given hash from the ordered list of keys.
+func (m *Map) deleteKey(keyHash mapHashableKey) {
+	if i := slices.Index(m.h, keyHash); i >= 0 {
+		m.k = slices.Delete(m.k, i, i+1)
+		m.h = slices.Delete(m.h, i, i+1)
+	}
 }
 
 func (m Map) hash() mapHashableKey {
@@ -408,8 +420,8 @@ func (m Map) hash() mapHashableKey {
 //	}
 func (m Map) Iterate() iter.Seq2[Value, Value] {
 	return func(yield func(Value, Value) bool) {
-		for _, k := range m.k {
-			if !yield(k, m.v[k.hash()]) {
+		for i, k := range m.k {
+			if !yield(k, m.v[m.h[i]]) {
 				return
 			}
 		}

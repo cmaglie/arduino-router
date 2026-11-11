@@ -12,6 +12,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/arduino/arduino-router/msgpack"
 
@@ -1930,4 +1931,25 @@ func TestToString(t *testing.T) {
 	require.False(t, ok)
 	_, ok = msgpack.ToString([]byte("c"))
 	require.False(t, ok)
+}
+
+func TestDecodeNestedMapKeys(t *testing.T) {
+	// Maps used as keys of maps: hashing them must not take exponential time
+	depth := 64
+	in := append(bytes.Repeat([]byte{0x81}, depth), bytes.Repeat([]byte{0xc0}, depth+1)...)
+	done := make(chan error, 1)
+	go func() {
+		v, err := msgpack.Decode(bytes.NewBuffer(in))
+		if err == nil {
+			_ = v.String()
+			_, err = msgpack.Marshal(v)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "decoding nested map keys took too long")
+	}
 }
