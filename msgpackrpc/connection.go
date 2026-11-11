@@ -37,6 +37,7 @@ type Connection struct {
 	notificationHandler     NotificationHandler
 	logger                  Logger
 	paramsAndResponsesAsRaw bool
+	maxIncomingMessageSize  atomic.Int64
 
 	activeOutRequests      map[MessageID]*outRequest
 	activeOutRequestsMutex sync.Mutex
@@ -87,7 +88,7 @@ func NewConnection(in io.ReadCloser, out io.WriteCloser, requestHandler RequestH
 			// ignore errors
 		}
 	}
-	return &Connection{
+	c := &Connection{
 		in:                  in,
 		out:                 out,
 		msgpBuffer:          nil, // no max buffer size by default, can be set with SetMaxBufferSize
@@ -97,6 +98,48 @@ func NewConnection(in io.ReadCloser, out io.WriteCloser, requestHandler RequestH
 		activeOutRequests:   map[MessageID]*outRequest{},
 		logger:              NullLogger{},
 	}
+	c.SetMaxIncomingMessageSize(DefaultMaxIncomingMessageSize)
+	return c
+}
+
+// DefaultMaxIncomingMessageSize is the default maximum size of an incoming
+// message, see SetMaxIncomingMessageSize.
+const DefaultMaxIncomingMessageSize = 1024 * 1024
+
+// ErrMessageTooLarge is returned when an incoming message exceeds the
+// maximum size set with SetMaxIncomingMessageSize.
+var ErrMessageTooLarge = errors.New("incoming message too large")
+
+// SetMaxIncomingMessageSize sets the maximum size in bytes of an incoming message
+// (default is DefaultMaxIncomingMessageSize). A value <= 0 means no limit.
+// If a message exceeds the limit, the connection is closed: the remainder of
+// the message is not read, so the stream can't be resynchronized.
+// It is safe to call this method while the connection is running.
+func (c *Connection) SetMaxIncomingMessageSize(size int64) {
+	c.maxIncomingMessageSize.Store(size)
+}
+
+// budgetReader is an io.Reader that returns ErrMessageTooLarge after
+// reading the given number of bytes. It never reads more than the budget
+// from the underlying reader.
+type budgetReader struct {
+	r    io.Reader
+	left int64
+}
+
+func (b *budgetReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if b.left <= 0 {
+		return 0, ErrMessageTooLarge
+	}
+	if int64(len(p)) > b.left {
+		p = p[:b.left]
+	}
+	n, err := b.r.Read(p)
+	b.left -= int64(n)
+	return n, err
 }
 
 // SetLogger sets the logger for the connection.
@@ -156,6 +199,10 @@ func (e *invalidRPCMessageError) Unwrap() error {
 // It returns an rpcPacket struct containing the decoded data, or an error
 // if the packet is invalid, in such case the invalid packet is skipped.
 func (c *Connection) decodeRpcPacket(in io.Reader) (rpcPacket, error) {
+	if limit := c.maxIncomingMessageSize.Load(); limit > 0 {
+		in = &budgetReader{r: in, left: limit}
+	}
+
 	// This function is used to skip the invalid packet and return an error.
 	// n elements will be skipped from the decoder, and the error will be returned.
 	// If also skipping fails, the skipping error will be returned, with the original error incorporated.
@@ -248,8 +295,8 @@ func (c *Connection) decodeRpcPacket(in io.Reader) (rpcPacket, error) {
 
 		// Now remains only the params to decode, which is an array of length paramLen
 
-		packet.params = make([]any, paramLen)
-		toSkip := paramLen
+		// Do not trust the declared length: grow the slice as params are read.
+		packet.params = make([]any, 0, min(paramLen, 64))
 		for i := range paramLen {
 			var p any
 			if c.paramsAndResponsesAsRaw {
@@ -260,8 +307,7 @@ func (c *Connection) decodeRpcPacket(in io.Reader) (rpcPacket, error) {
 			if err != nil {
 				return rpcPacket{}, fmt.Errorf("error decoding param %d: %w", i, err)
 			}
-			packet.params[i] = p
-			toSkip--
+			packet.params = append(packet.params, p)
 		}
 
 	case messageTypeResponse:
