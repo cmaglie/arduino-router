@@ -6,6 +6,7 @@
 package msgpackrpc
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,8 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vmihailenco/msgpack/v5"
-	"github.com/vmihailenco/msgpack/v5/msgpcode"
+	"github.com/arduino/arduino-router/msgpack"
 )
 
 type MessageID uint
@@ -30,7 +30,6 @@ const (
 type Connection struct {
 	in                      io.ReadCloser
 	out                     io.WriteCloser
-	msgpEncoder             *msgpack.Encoder
 	msgpBuffer              *LimitedBuffer
 	outMutex                sync.Mutex
 	errorHandler            ErrorHandler
@@ -38,6 +37,7 @@ type Connection struct {
 	notificationHandler     NotificationHandler
 	logger                  Logger
 	paramsAndResponsesAsRaw bool
+	maxIncomingMessageSize  atomic.Int64
 
 	activeOutRequests      map[MessageID]*outRequest
 	activeOutRequestsMutex sync.Mutex
@@ -73,8 +73,6 @@ type ErrorHandler func(error)
 
 // NewConnection creates a new MessagePack-RPC Connection handler.
 func NewConnection(in io.ReadCloser, out io.WriteCloser, requestHandler RequestHandler, notificationHandler NotificationHandler, errorHandler ErrorHandler) *Connection {
-	msgpEncoder := msgpack.NewEncoder(nil)
-	msgpEncoder.UseCompactInts(true)
 	if requestHandler == nil {
 		requestHandler = func(logger FunctionLogger, method string, params []any, res ResponseSender) {
 			_ = res(nil, fmt.Errorf("method not implemented: %s", method))
@@ -90,10 +88,9 @@ func NewConnection(in io.ReadCloser, out io.WriteCloser, requestHandler RequestH
 			// ignore errors
 		}
 	}
-	return &Connection{
+	c := &Connection{
 		in:                  in,
 		out:                 out,
-		msgpEncoder:         msgpEncoder,
 		msgpBuffer:          nil, // no max buffer size by default, can be set with SetMaxBufferSize
 		requestHandler:      requestHandler,
 		notificationHandler: notificationHandler,
@@ -101,6 +98,48 @@ func NewConnection(in io.ReadCloser, out io.WriteCloser, requestHandler RequestH
 		activeOutRequests:   map[MessageID]*outRequest{},
 		logger:              NullLogger{},
 	}
+	c.SetMaxIncomingMessageSize(DefaultMaxIncomingMessageSize)
+	return c
+}
+
+// DefaultMaxIncomingMessageSize is the default maximum size of an incoming
+// message, see SetMaxIncomingMessageSize.
+const DefaultMaxIncomingMessageSize = 1024 * 1024
+
+// ErrMessageTooLarge is returned when an incoming message exceeds the
+// maximum size set with SetMaxIncomingMessageSize.
+var ErrMessageTooLarge = errors.New("incoming message too large")
+
+// SetMaxIncomingMessageSize sets the maximum size in bytes of an incoming message
+// (default is DefaultMaxIncomingMessageSize). A value <= 0 means no limit.
+// If a message exceeds the limit, the connection is closed: the remainder of
+// the message is not read, so the stream can't be resynchronized.
+// It is safe to call this method while the connection is running.
+func (c *Connection) SetMaxIncomingMessageSize(size int64) {
+	c.maxIncomingMessageSize.Store(size)
+}
+
+// budgetReader is an io.Reader that returns ErrMessageTooLarge after
+// reading the given number of bytes. It never reads more than the budget
+// from the underlying reader.
+type budgetReader struct {
+	r    io.Reader
+	left int64
+}
+
+func (b *budgetReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if b.left <= 0 {
+		return 0, ErrMessageTooLarge
+	}
+	if int64(len(p)) > b.left {
+		p = p[:b.left]
+	}
+	n, err := b.r.Read(p)
+	b.left -= int64(n)
+	return n, err
 }
 
 // SetLogger sets the logger for the connection.
@@ -159,37 +198,44 @@ func (e *invalidRPCMessageError) Unwrap() error {
 // decodeRpcPacket decodes a MessagePack-RPC packet from the given decoder.
 // It returns an rpcPacket struct containing the decoded data, or an error
 // if the packet is invalid, in such case the invalid packet is skipped.
-func (c *Connection) decodeRpcPacket(in *msgpack.Decoder) (rpcPacket, error) {
+func (c *Connection) decodeRpcPacket(in io.Reader) (rpcPacket, error) {
+	if limit := c.maxIncomingMessageSize.Load(); limit > 0 {
+		in = &budgetReader{r: in, left: limit}
+	}
+
 	// This function is used to skip the invalid packet and return an error.
 	// n elements will be skipped from the decoder, and the error will be returned.
 	// If also skipping fails, the skipping error will be returned, with the original error incorporated.
-	skipAndError := func(n int, err error) (rpcPacket, error) {
+	skipAndError := func(n uint, err error) (rpcPacket, error) {
 		for range n {
-			if skipErr := in.Skip(); skipErr != nil {
+			if skipErr := msgpack.Skip(in); skipErr != nil {
 				return rpcPacket{}, fmt.Errorf("failed to skip invalid packet: %w; invalid packet: %v", skipErr, err)
 			}
 		}
 		return rpcPacket{}, err
 	}
 
-	if t, err := in.PeekCode(); err != nil {
+	peekBytes, kind, l, _, err := msgpack.DecodeSingle(in)
+	if err != nil {
 		return rpcPacket{}, fmt.Errorf("can't read message: %w", err)
-	} else if !msgpcode.IsFixedArray(t) && t != msgpcode.Array16 && t != msgpcode.Array32 {
-		return skipAndError(1, &invalidRPCMessageError{msg: "invalid packet, expected array"})
+	} else if kind != msgpack.ValueKindArray {
+		if skipErr := msgpack.Skip(io.MultiReader(bytes.NewBuffer(peekBytes), in)); skipErr != nil {
+			return rpcPacket{}, fmt.Errorf("failed to skip invalid packet: %w; invalid packet: %v", skipErr, err)
+		}
+		return rpcPacket{}, &invalidRPCMessageError{msg: "invalid packet, expected array"}
 	}
-	l, _ := in.DecodeArrayLen()
 	if l < 3 || l > 4 {
 		return skipAndError(l, &invalidRPCMessageError{msg: "invalid packet, expected array with 3 or 4 elements"})
 	}
 
-	maybeMsgType, err := in.DecodeInterface()
+	maybeMsgType, err := msgpack.Unmarshal(in)
 	if err != nil {
 		return rpcPacket{}, fmt.Errorf("can't read message type: %w", err)
 	}
 	l--
 
 	var packet rpcPacket
-	if msgType, ok := ToInt(maybeMsgType); !ok {
+	if msgType, ok := msgpack.ToInt(maybeMsgType); !ok {
 		return skipAndError(l, &invalidRPCMessageError{msg: "invalid packet, expected int for message type", cause: err})
 	} else {
 		packet.msgType = msgType
@@ -210,12 +256,12 @@ func (c *Connection) decodeRpcPacket(in *msgpack.Decoder) (rpcPacket, error) {
 	// Decode the message ID for requests and responses
 	switch packet.msgType {
 	case messageTypeRequest, messageTypeResponse:
-		maybeId, err := in.DecodeInterface()
+		maybeId, err := msgpack.Unmarshal(in)
 		if err != nil {
 			return rpcPacket{}, fmt.Errorf("can't read message ID: %w", err)
 		}
 		l--
-		if id, ok := ToUint(maybeId); !ok {
+		if id, ok := msgpack.ToUint(maybeId); !ok {
 			return skipAndError(l, &invalidRPCMessageError{msg: "invalid packet, expected uint for message ID", cause: err})
 		} else {
 			packet.msgID = MessageID(id)
@@ -224,61 +270,65 @@ func (c *Connection) decodeRpcPacket(in *msgpack.Decoder) (rpcPacket, error) {
 
 	switch packet.msgType {
 	case messageTypeRequest, messageTypeNotification:
-		maybeMethod, err := in.DecodeInterface()
+		maybeMethod, err := msgpack.Unmarshal(in)
 		if err != nil {
 			return rpcPacket{}, fmt.Errorf("can't read method name: %w", err)
 		}
 		l--
-		if method, ok := maybeMethod.(string); !ok {
+		if method, ok := msgpack.ToString(maybeMethod); !ok {
 			return skipAndError(l, &invalidRPCMessageError{msg: "invalid packet, expected string for method name", cause: err})
 		} else {
 			packet.method = method
 		}
 
-		if t, err := in.PeekCode(); err != nil {
+		var paramLen uint
+		if peekBytes, kind, n, _, err := msgpack.DecodeSingle(in); err != nil {
 			return rpcPacket{}, fmt.Errorf("can't read message: %w", err)
-		} else if !msgpcode.IsFixedArray(t) && t != msgpcode.Array16 && t != msgpcode.Array32 {
-			return skipAndError(1, &invalidRPCMessageError{msg: "invalid packet, expected array for parameters"})
+		} else if kind != msgpack.ValueKindArray {
+			if err := msgpack.Skip(io.MultiReader(bytes.NewBuffer(peekBytes), in)); err != nil {
+				return rpcPacket{}, fmt.Errorf("failed to skip invalid packet: %w", err)
+			}
+			return rpcPacket{}, &invalidRPCMessageError{msg: "invalid packet, expected array for parameters"}
+		} else {
+			paramLen = n
 		}
-		paramLen, _ := in.DecodeArrayLen()
 
 		// Now remains only the params to decode, which is an array of length paramLen
 
-		packet.params = make([]any, paramLen)
-		toSkip := paramLen
+		// Do not trust the declared length: grow the slice as params are read.
+		packet.params = make([]any, 0, min(paramLen, 64))
 		for i := range paramLen {
 			var p any
 			if c.paramsAndResponsesAsRaw {
-				p, err = in.DecodeRaw()
+				p, err = msgpack.DecodeRaw(in)
 			} else {
-				p, err = in.DecodeInterface()
+				p, err = msgpack.Unmarshal(in)
 			}
 			if err != nil {
 				return rpcPacket{}, fmt.Errorf("error decoding param %d: %w", i, err)
 			}
-			packet.params[i] = p
-			toSkip--
+			packet.params = append(packet.params, p)
 		}
 
 	case messageTypeResponse:
 		if c.paramsAndResponsesAsRaw {
-			if e, err := in.DecodeRaw(); err != nil {
+			if e, err := msgpack.DecodeRaw(in); err != nil {
 				return rpcPacket{}, fmt.Errorf("error decoding error: %w", err)
 			} else {
 				packet.reqError = e
 			}
-			if r, err := in.DecodeRaw(); err != nil {
+			if r, err := msgpack.DecodeRaw(in); err != nil {
 				return rpcPacket{}, fmt.Errorf("error decoding result: %w", err)
 			} else {
 				packet.reqResult = r
 			}
 		} else {
-			if e, err := in.DecodeInterface(); err != nil {
+			if e, err := msgpack.Unmarshal(in); err != nil {
 				return rpcPacket{}, fmt.Errorf("error decoding error: %w", err)
 			} else {
 				packet.reqError = e
 			}
-			if r, err := in.DecodeInterface(); err != nil {
+			if r, err := msgpack.Unmarshal(in); err != nil {
 				return rpcPacket{}, fmt.Errorf("error decoding result: %w", err)
 			} else {
 				packet.reqResult = r
@@ -290,7 +340,7 @@ func (c *Connection) decodeRpcPacket(in *msgpack.Decoder) (rpcPacket, error) {
 }
 
 func (c *Connection) Run() {
-	in := msgpack.NewDecoder(c.in)
+	in := c.in
 	for {
 		start := time.Now()
 		packet, err := c.decodeRpcPacket(in)
@@ -433,16 +483,12 @@ func (c *Connection) send(data ...any) error {
 
 		if c.msgpBuffer == nil {
 			// Unlimited buffer size, write directly to the out stream without buffering
-			c.msgpEncoder.Reset(c.out)
-			c.msgpEncoder.UseCompactInts(true)
-			return c.msgpEncoder.Encode(data)
+			return msgpack.Encode(data, c.out)
 		}
 
 		// Limited buffer size, write to the buffer first and then flush it to the out stream
 		c.msgpBuffer.Reset()
-		c.msgpEncoder.Reset(c.msgpBuffer)
-		c.msgpEncoder.UseCompactInts(true)
-		if err := c.msgpEncoder.Encode(data); err != nil {
+		if err := msgpack.Encode(data, c.msgpBuffer); err != nil {
 			return err
 		}
 		_, err := c.out.Write(c.msgpBuffer.Bytes())
