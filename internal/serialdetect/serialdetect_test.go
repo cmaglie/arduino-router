@@ -17,19 +17,17 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/vmihailenco/msgpack/v5"
 
 	"github.com/arduino/arduino-router/internal/noisyline"
 	"github.com/arduino/arduino-router/internal/seriallink"
+	"github.com/arduino/arduino-router/msgpack"
 	"github.com/arduino/arduino-router/msgpackrpc"
 )
 
 func encode(t *testing.T, v ...any) []byte {
 	var b bytes.Buffer
-	enc := msgpack.NewEncoder(&b)
-	enc.UseCompactInts(true)
 	for _, x := range v {
-		require.NoError(t, enc.Encode(x))
+		require.NoError(t, msgpack.Encode(x, &b))
 	}
 	return b.Bytes()
 }
@@ -268,9 +266,10 @@ func TestAutoStreamRawToReliable(t *testing.T) {
 
 	s := NewAutoStream(line.OpenA(), newReliable, nil)
 	defer s.Close()
-	dec := msgpack.NewDecoder(s)
-	var msg []any
-	require.NoError(t, dec.Decode(&msg))
+	obj, err := msgpack.Unmarshal(s)
+	require.NoError(t, err)
+	msg, ok := obj.([]any)
+	require.True(t, ok)
 	require.Equal(t, "mon/write", msg[1])
 
 	// Some raw data containing zeros, then the new firmware starts

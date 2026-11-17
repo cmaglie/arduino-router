@@ -28,13 +28,12 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"math"
 	"sync"
 	"unicode"
 
-	"github.com/vmihailenco/msgpack/v5"
-	"github.com/vmihailenco/msgpack/v5/msgpcode"
-
 	"github.com/arduino/arduino-router/internal/seriallink"
+	"github.com/arduino/arduino-router/msgpack"
 )
 
 // Protocol is a serial port protocol.
@@ -130,42 +129,54 @@ const (
 
 // checkRPCMessage checks if b starts with a well-formed msgpack-rpc message.
 func checkRPCMessage(b []byte) checkResult {
-	// msgpack-rpc messages are arrays of 3 or 4 elements
-	if b[0] != msgpcode.FixedArrayLow|3 && b[0] != msgpcode.FixedArrayLow|4 {
-		return invalid
-	}
-	dec := msgpack.NewDecoder(bytes.NewReader(b))
 	result := func(err error) checkResult {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return incomplete
 		}
 		return invalid
 	}
-	size, _ := dec.DecodeArrayLen()
-	msgType, err := dec.DecodeInt()
+	in := bytes.NewReader(b)
+	_, kind, size, _, err := msgpack.DecodeSingle(in)
 	if err != nil {
 		return result(err)
 	}
+	// msgpack-rpc messages are arrays of 3 or 4 elements
+	if kind != msgpack.ValueKindArray || size < 3 || size > 4 {
+		return invalid
+	}
+
+	maybeMsgType, err := msgpack.Decode(in)
+	if err != nil {
+		return result(err)
+	}
+	msgType, ok := msgpack.ToInt(maybeMsgType)
+	if !ok {
+		return invalid
+	}
 	switch {
 	case msgType == 0 && size == 4: // request: [0, msgid, method, params]
-		if _, err := dec.DecodeUint32(); err != nil {
+		if v, err := msgpack.Decode(in); err != nil {
 			return result(err)
+		} else if v, ok := msgpack.ToUint(v); !ok || v > math.MaxUint32 {
+			return invalid
 		}
-		if res := checkMethodAndParams(dec); res != valid {
+		if res := checkMethodAndParams(in); res != valid {
 			return res
 		}
 	case msgType == 1 && size == 4: // response: [1, msgid, error, result]
-		if _, err := dec.DecodeUint32(); err != nil {
+		if v, err := msgpack.Decode(in); err != nil {
+			return result(err)
+		} else if v, ok := msgpack.ToUint(v); !ok || v > math.MaxUint32 {
+			return invalid
+		}
+		if err := msgpack.Skip(in); err != nil {
 			return result(err)
 		}
-		if err := dec.Skip(); err != nil {
-			return result(err)
-		}
-		if err := dec.Skip(); err != nil {
+		if err := msgpack.Skip(in); err != nil {
 			return result(err)
 		}
 	case msgType == 2 && size == 3: // notification: [2, method, params]
-		if res := checkMethodAndParams(dec); res != valid {
+		if res := checkMethodAndParams(in); res != valid {
 			return res
 		}
 	default:
@@ -174,16 +185,20 @@ func checkRPCMessage(b []byte) checkResult {
 	return valid
 }
 
-func checkMethodAndParams(dec *msgpack.Decoder) checkResult {
+func checkMethodAndParams(in io.Reader) checkResult {
 	result := func(err error) checkResult {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return incomplete
 		}
 		return invalid
 	}
-	method, err := dec.DecodeString()
+	maybeMethod, err := msgpack.Decode(in)
 	if err != nil {
 		return result(err)
+	}
+	method, ok := msgpack.ToString(maybeMethod)
+	if !ok {
+		return invalid
 	}
 	if method == "" || len(method) > 256 {
 		return invalid
@@ -193,14 +208,15 @@ func checkMethodAndParams(dec *msgpack.Decoder) checkResult {
 			return invalid
 		}
 	}
-	code, err := dec.PeekCode()
+
+	header, kind, _, _, err := msgpack.DecodeSingle(in)
 	if err != nil {
 		return result(err)
 	}
-	if !msgpcode.IsFixedArray(code) && code != msgpcode.Array16 && code != msgpcode.Array32 {
+	if kind != msgpack.ValueKindArray {
 		return invalid
 	}
-	if err := dec.Skip(); err != nil {
+	if err := msgpack.Skip(io.MultiReader(bytes.NewBuffer(header), in)); err != nil {
 		return result(err)
 	}
 	return valid
